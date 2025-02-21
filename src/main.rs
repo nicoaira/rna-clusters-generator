@@ -134,7 +134,159 @@ fn main() {
 
     // 8) If `--plot`, we do not implement actual plotting in Rust, but we can mention it
     if args.plot {
-        info!("Plotting was requested, but this Rust version does not implement it. Ignoring...");
+        use std::process::Command;
+        use rand::seq::SliceRandom;
+        use std::fs;
+        
+        info!("Plotting requested, sampling {} triplets...", args.num_plots);
+        let mut rng = rand::thread_rng();
+        let sampled: Vec<_> = triplets
+            .choose_multiple(&mut rng, args.num_plots)
+            .cloned()
+            .collect();
+
+        // Create directories for plots and temporary scripts/images:
+        let plot_dir = Path::new(out_dir).join("plots");
+        fs::create_dir_all(&plot_dir)
+            .expect("Failed to create plot directory");
+        let temp_dir = Path::new(out_dir).join("temp_plots");
+        fs::create_dir_all(&temp_dir)
+            .expect("Failed to create temporary plot directory");
+
+        // Use absolute (canonical) path for images
+        let abs_temp_dir = temp_dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        // Build a batch script with one rnartist block per drawing.
+        let mut batch_script = String::new();
+        for triplet in &sampled {
+            let anchor_block = format!(
+r#"rnartist {{
+  png {{
+    path = "{}"
+    width = 500.0
+    height = 500.0
+  }}
+  ss {{
+    bn {{
+      value = "{}"
+      seq = "{}"
+      name = "triplet_{}_anchor"
+    }}
+  }}
+  theme {{
+    details {{
+      value = 5
+    }}
+    scheme {{
+      value = "Pumpkin Vegas"
+    }}
+  }}
+}}"#,
+                abs_temp_dir,
+                triplet.anchor_structure,
+                triplet.anchor_seq,
+                triplet.triplet_id
+            );
+            let positive_block = format!(
+r#"rnartist {{
+  png {{
+    path = "{}"
+    width = 500.0
+    height = 500.0
+  }}
+  ss {{
+    bn {{
+      value = "{}"
+      seq = "{}"
+      name = "triplet_{}_positive"
+    }}
+  }}
+  theme {{
+    details {{
+      value = 5
+    }}
+    scheme {{
+      value = "Pumpkin Vegas"
+    }}
+  }}
+}}"#,
+                abs_temp_dir,
+                triplet.positive_structure,
+                triplet.positive_seq,
+                triplet.triplet_id
+            );
+            let negative_block = format!(
+r#"rnartist {{
+  png {{
+    path = "{}"
+    width = 500.0
+    height = 500.0
+  }}
+  ss {{
+    bn {{
+      value = "{}"
+      seq = "{}"
+      name = "triplet_{}_negative"
+    }}
+  }}
+  theme {{
+    details {{
+      value = 5
+    }}
+    scheme {{
+      value = "Pumpkin Vegas"
+    }}
+  }}
+}}"#,
+                abs_temp_dir,
+                triplet.negative_structure,
+                triplet.negative_seq,
+                triplet.triplet_id
+            );
+            batch_script.push_str(&anchor_block);
+            batch_script.push_str("\n");
+            batch_script.push_str(&positive_block);
+            batch_script.push_str("\n");
+            batch_script.push_str(&negative_block);
+            batch_script.push_str("\n");
+        }
+
+        // Write the combined batch script:
+        let batch_script_path = temp_dir.join("batch_plot.kts");
+        fs::write(&batch_script_path, batch_script)
+            .expect("Failed to write batch plot script");
+
+        // Run rnartistcore once on the batch script.
+        let status = Command::new("rnartistcore")
+            .arg(batch_script_path.to_string_lossy().as_ref())
+            .status()
+            .expect("Failed to execute rnartistcore");
+        if !status.success() {
+            eprintln!("rnartistcore failed on batch plotting script");
+        }
+
+        // For each triplet, join its three PNGs into one composite image.
+        for triplet in sampled {
+            let anchor_png = temp_dir.join(format!("triplet_{}_anchor.png", triplet.triplet_id));
+            let positive_png = temp_dir.join(format!("triplet_{}_positive.png", triplet.triplet_id));
+            let negative_png = temp_dir.join(format!("triplet_{}_negative.png", triplet.triplet_id));
+            let composite_path = plot_dir.join(format!("triplet_{}.png", triplet.triplet_id));
+            let montage_status = Command::new("montage")
+                .args(&[
+                    anchor_png.to_string_lossy().as_ref(),
+                    positive_png.to_string_lossy().as_ref(),
+                    negative_png.to_string_lossy().as_ref(),
+                    "-tile", "3x1",
+                    "-geometry", "+10+10",
+                    composite_path.to_string_lossy().as_ref(),
+                ])
+                .status()
+                .expect("Failed to execute montage command");
+            if !montage_status.success() {
+                eprintln!("montage failed for triplet {}", triplet.triplet_id);
+            }
+        }
+        info!("Plot images saved in {:?}", plot_dir);
     }
 
     info!("Data generation complete. Output in: {}", out_dir);

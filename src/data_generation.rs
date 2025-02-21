@@ -748,52 +748,66 @@ pub fn save_dataset_csv(
 
 /// Generate multiple triplets in "batches", store them in a Vec.
 pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
-    let mut records = Vec::with_capacity(args.num_structures);
+    use rayon::prelude::*;
     let total = args.num_structures;
     let batch_size = args.batch_size;
-    let mut generated = 0;
 
-    // Create a progress bar using indicatif
+    // Create progress bar
     let pb = indicatif::ProgressBar::new(total as u64);
-    
-    while generated < total {
-        let current_batch_size = std::cmp::min(batch_size, total - generated);
-        // Generate batch_triplets by calling generate_triplet for each item in the batch.
-        let mut batch_triplets = Vec::with_capacity(current_batch_size);
-        for i in 0..current_batch_size {
-            let mut triplet = generate_triplet(args);
-            triplet.triplet_id = generated + i;
-            batch_triplets.push(triplet);
-        }
-        // Batch fold anchors.
-        let anchor_pairs: Vec<(String, String)> = batch_triplets.iter()
-            .map(|r| (format!("A{}", r.triplet_id), r.anchor_seq.clone()))
-            .collect();
-        if let Ok(anchor_map) = fold_rna_batch(&anchor_pairs) {
-            for record in batch_triplets.iter_mut() {
-                if let Some(struc) = anchor_map.get(&format!("A{}", record.triplet_id)) {
-                    record.anchor_structure = struc.clone();
+
+    // Build a thread pool with num_workers
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.num_workers)
+        .build()
+        .unwrap();
+
+    // Prepare chunk indices
+    let chunk_count = (total + batch_size - 1) / batch_size;
+    let chunk_indices: Vec<usize> = (0..chunk_count).collect();
+
+    let results: Vec<RnaTripletRecord> = pool.install(|| {
+        chunk_indices.par_iter().flat_map(|chunk_id| {
+            let start = chunk_id * batch_size;
+            let cur_size = std::cmp::min(batch_size, total - start);
+            let mut batch_triplets = Vec::with_capacity(cur_size);
+
+            for i in 0..cur_size {
+                let mut triplet = generate_triplet(args);
+                triplet.triplet_id = start + i;
+                batch_triplets.push(triplet);
+            }
+
+            // Batch fold anchors.
+            let anchor_pairs: Vec<(String, String)> = batch_triplets.iter()
+                .map(|r| (format!("A{}", r.triplet_id), r.anchor_seq.clone()))
+                .collect();
+            if let Ok(anchor_map) = fold_rna_batch(&anchor_pairs) {
+                for record in batch_triplets.iter_mut() {
+                    if let Some(struc) = anchor_map.get(&format!("A{}", record.triplet_id)) {
+                        record.anchor_structure = struc.clone();
+                    }
                 }
             }
-        }
-        // Batch fold negatives.
-        let neg_pairs: Vec<(String, String)> = batch_triplets.iter()
-            .map(|r| (format!("N{}", r.triplet_id), r.negative_seq.clone()))
-            .collect();
-        if let Ok(neg_map) = fold_rna_batch(&neg_pairs) {
-            for record in batch_triplets.iter_mut() {
-                if let Some(struc) = neg_map.get(&format!("N{}", record.triplet_id)) {
-                    record.negative_structure = struc.clone();
+
+            // Batch fold negatives.
+            let neg_pairs: Vec<(String, String)> = batch_triplets.iter()
+                .map(|r| (format!("N{}", r.triplet_id), r.negative_seq.clone()))
+                .collect();
+            if let Ok(neg_map) = fold_rna_batch(&neg_pairs) {
+                for record in batch_triplets.iter_mut() {
+                    if let Some(struc) = neg_map.get(&format!("N{}", record.triplet_id)) {
+                        record.negative_structure = struc.clone();
+                    }
                 }
             }
-        }
-        records.extend(batch_triplets);
-        generated += current_batch_size;
-        pb.inc(current_batch_size as u64);
-    }
-    
+
+            pb.inc(cur_size as u64);
+            batch_triplets
+        }).collect()
+    });
+
     pb.finish();
-    records
+    results
 }
 
 /// Build a metadata object for the run
