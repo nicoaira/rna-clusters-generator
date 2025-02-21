@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader};
 
 use chrono::Local;
 use rand::distributions::{Distribution, Uniform};
@@ -50,6 +51,7 @@ pub fn generate_random_rna(length: usize) -> String {
 
 /// Fold an RNA sequence using `RNAfold` in a child process, capturing the MFE structure.
 /// We only return the dot-bracket; we do not parse free energy from the output.
+#[allow(dead_code)]
 pub fn fold_rna(seq: &str) -> Result<String, String> {
     // We'll run: echo "ACG..." | RNAfold --noPS
     // and parse the second line from stdout for the structure
@@ -201,9 +203,9 @@ pub fn generate_negative_sample(seq: &str, allowed_variation: isize) -> (String,
         }
     }
 
-    // fold
-    let folded = fold_rna(&new_seq).unwrap_or_else(|_| ".".repeat(new_seq.len()));
-    (new_seq, folded)
+    // Return placeholder structure; will update it in batch.
+    let placeholder = ".".repeat(new_seq.len());
+    (new_seq, placeholder)
 }
 
 // ============ Node identification ============
@@ -299,7 +301,8 @@ fn delete_base(seq: &mut String, structure: &mut String, deletion_idx: usize) {
 
 // ============ Public facing "generate triplet" ============
 
-/// Generate an anchor (sequence+structure) for the given distribution parameters.
+/// Generate an anchor without folding now.
+/// Later the batch function will update its structure.
 pub fn generate_anchor(args: &Cli) -> (String, String) {
     let length = choose_seq_length(
         &args.seq_len_distribution,
@@ -309,7 +312,8 @@ pub fn generate_anchor(args: &Cli) -> (String, String) {
         args.seq_len_sd,
     );
     let anchor_seq = generate_random_rna(length);
-    let anchor_structure = fold_rna(&anchor_seq).unwrap_or(".".repeat(length));
+    // Set placeholder; will be updated in batch.
+    let anchor_structure = ".".repeat(length);
     (anchor_seq, anchor_structure)
 }
 
@@ -350,15 +354,10 @@ pub fn generate_positive(
     // We'll track how many modifications we've done on each node
     let mut mod_counts: HashMap<String, usize> = HashMap::new();
 
-    // Helper function to re-build the bulge graph after any change
-    let rebuild_bg = |sq: &str, st: &mut String| -> BulgeGraph {
-        // re-fold to maintain consistent structure for subsequent modifications
-        let folded = fold_rna(sq).unwrap_or(".".to_string().repeat(sq.len()));
-        // Instead of `*st = folded.clone()`, do:
-        st.clear();
-        st.push_str(&folded);
-
-        BulgeGraph::from_dot_bracket(&folded).unwrap_or_else(|_e| BulgeGraph::new())
+    // New rebuild closure: simply re-parse the current structure.
+    let rebuild_bg = |_: &str, st: &mut String| -> BulgeGraph {
+        // Use the existing pos_struct to build the BulgeGraph.
+        BulgeGraph::from_dot_bracket(st).unwrap_or_else(|_| BulgeGraph::new())
     };
 
     // Modify stems
@@ -698,11 +697,11 @@ pub fn generate_triplet(args: &Cli) -> RnaTripletRecord {
     RnaTripletRecord {
         triplet_id: 0, // we’ll set the real ID later
         anchor_seq,
-        anchor_structure,
+        anchor_structure, // placeholder; to be updated in batch below
         positive_seq: pos_seq,
         positive_structure: pos_struct,
         negative_seq: neg_seq,
-        negative_structure: neg_struct,
+        negative_structure: neg_struct, // placeholder
     }
 }
 
@@ -750,16 +749,50 @@ pub fn save_dataset_csv(
 /// Generate multiple triplets in "batches", store them in a Vec.
 pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
     let mut records = Vec::with_capacity(args.num_structures);
+    let total = args.num_structures;
+    let batch_size = args.batch_size;
+    let mut generated = 0;
 
-    // Option A: single-threaded approach, just do it in a for loop
-    // Option B: multi-threaded approach with 'rayon' or manual threads
-    // For simplicity here, we'll do single-thread unless we strongly need concurrency:
-    for i in 0..args.num_structures {
-        let mut triplet = generate_triplet(args);
-        triplet.triplet_id = i;
-        records.push(triplet);
+    // Create a progress bar using indicatif
+    let pb = indicatif::ProgressBar::new(total as u64);
+    
+    while generated < total {
+        let current_batch_size = std::cmp::min(batch_size, total - generated);
+        // Generate batch_triplets by calling generate_triplet for each item in the batch.
+        let mut batch_triplets = Vec::with_capacity(current_batch_size);
+        for i in 0..current_batch_size {
+            let mut triplet = generate_triplet(args);
+            triplet.triplet_id = generated + i;
+            batch_triplets.push(triplet);
+        }
+        // Batch fold anchors.
+        let anchor_pairs: Vec<(String, String)> = batch_triplets.iter()
+            .map(|r| (format!("A{}", r.triplet_id), r.anchor_seq.clone()))
+            .collect();
+        if let Ok(anchor_map) = fold_rna_batch(&anchor_pairs) {
+            for record in batch_triplets.iter_mut() {
+                if let Some(struc) = anchor_map.get(&format!("A{}", record.triplet_id)) {
+                    record.anchor_structure = struc.clone();
+                }
+            }
+        }
+        // Batch fold negatives.
+        let neg_pairs: Vec<(String, String)> = batch_triplets.iter()
+            .map(|r| (format!("N{}", r.triplet_id), r.negative_seq.clone()))
+            .collect();
+        if let Ok(neg_map) = fold_rna_batch(&neg_pairs) {
+            for record in batch_triplets.iter_mut() {
+                if let Some(struc) = neg_map.get(&format!("N{}", record.triplet_id)) {
+                    record.negative_structure = struc.clone();
+                }
+            }
+        }
+        records.extend(batch_triplets);
+        generated += current_batch_size;
+        pb.inc(current_batch_size as u64);
     }
-
+    
+    pb.finish();
     records
 }
 
@@ -815,4 +848,57 @@ pub fn build_metadata(args: &Cli) -> serde_json::Value {
             "timing_log": args.timing_log,
         }
     })
+}
+
+// ----- New function: batched RNAfold -----
+pub fn fold_rna_batch(sequences: &[(String, String)]) -> Result<HashMap<String, String>, String> {
+    // Build multi-FASTA input. Each entry: ">ID\nSEQUENCE"
+    let input = sequences.iter()
+        .map(|(id, seq)| format!(">{}\n{}", id, seq))
+        .collect::<Vec<_>>()
+        .join("\n");
+    
+    let mut child = std::process::Command::new("RNAfold")
+        .arg("--noPS")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn RNAfold: {}", e))?;
+    
+    {
+        let mut stdin = child.stdin.take().ok_or("Failed to open RNAfold stdin")?;
+        std::io::Write::write_all(&mut stdin, input.as_bytes())
+            .map_err(|e| format!("Error writing to RNAfold stdin: {}", e))?;
+    }
+    let output = child.wait_with_output().map_err(|e| format!("RNAfold error: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("RNAfold exited with status: {}", output.status));
+    }
+    let reader = BufReader::new(&output.stdout[..]);
+    let mut results = HashMap::new();
+    // let mut current_id = String::new();  // Removed unused assignment
+    let _structure_line = String::new();
+    
+    // Parse FASTA output.
+    // Assume the output format:
+    // >ID
+    // SEQUENCE (same as input)
+    // dot-bracket and free energy info line; we take first token as structure.
+    let mut lines = reader.lines();
+    while let Some(line_res) = lines.next() {
+        let line = line_res.map_err(|e| format!("Reading RNAfold output: {}", e))?;
+        if line.starts_with('>') {
+            let current_id = line[1..].trim().to_string();
+            // skip the sequence line:
+            lines.next();
+            // next line is structure line.
+            if let Some(sline) = lines.next() {
+                let s = sline.map_err(|e| format!("Error reading structure: {}", e))?;
+                // take everything up to first space.
+                let structure = s.split_whitespace().next().unwrap_or("").to_string();
+                results.insert(current_id.clone(), structure);
+            }
+        }
+    }
+    Ok(results)
 }
