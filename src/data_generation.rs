@@ -312,8 +312,8 @@ pub fn generate_anchor(args: &Cli) -> (String, String) {
         args.seq_len_sd,
     );
     let anchor_seq = generate_random_rna(length);
-    // Set placeholder; will be updated in batch.
-    let anchor_structure = ".".repeat(length);
+    // Fold the anchor to obtain an initial dot-bracket structure instead of a placeholder of dots.
+    let anchor_structure = fold_rna(&anchor_seq).unwrap_or(".".repeat(length));
     (anchor_seq, anchor_structure)
 }
 
@@ -326,7 +326,6 @@ pub fn generate_positive(
     let mut pos_seq = anchor_seq.to_string();
     let mut pos_struct = anchor_structure.to_string();
 
-    // Possibly normalize how many modifications we do.
     let length = anchor_seq.len();
     let mut n_stem_indels = args.n_stem_indels;
     let mut n_hloop_indels = args.n_hloop_indels;
@@ -334,15 +333,11 @@ pub fn generate_positive(
     let mut n_bulge_indels = args.n_bulge_indels;
     let mut n_mloop_indels = args.n_mloop_indels;
 
+    // Normalize modification counts if enabled.
     if args.mod_normalization {
         let factor = (length as f64 / args.normalization_len as f64).max(1.0);
-        // scale each
         let scale = |val: usize| -> usize {
-            if val <= 1 {
-                val
-            } else {
-                ((val as f64) * factor).round() as usize
-            }
+            if val <= 1 { val } else { ((val as f64) * factor).round() as usize }
         };
         n_stem_indels = scale(n_stem_indels);
         n_hloop_indels = scale(n_hloop_indels);
@@ -351,68 +346,51 @@ pub fn generate_positive(
         n_mloop_indels = scale(n_mloop_indels);
     }
 
-    // We'll track how many modifications we've done on each node
     let mut mod_counts: HashMap<String, usize> = HashMap::new();
-
-    // New rebuild closure: simply re-parse the current structure.
+    // Define a rebuild closure that builds the bulge graph from the current structure.
     let rebuild_bg = |_: &str, st: &mut String| -> BulgeGraph {
-        // Use the existing pos_struct to build the BulgeGraph.
         BulgeGraph::from_dot_bracket(st).unwrap_or_else(|_| BulgeGraph::new())
     };
 
-    // Modify stems
+    // Apply stem modifications.
     for _ in 0..n_stem_indels {
-        (pos_seq, pos_struct, mod_counts) = modify_stem(
-            pos_seq,
-            pos_struct,
-            &args,
-            &mut mod_counts,
-            rebuild_bg,
-        );
+        let (new_seq, new_struct, new_mod_counts) =
+            modify_stem(pos_seq, pos_struct, args, &mut mod_counts, &rebuild_bg);
+        pos_seq = new_seq;
+        pos_struct = new_struct;
+        mod_counts = new_mod_counts;
     }
-    // Modify hairpin loops
+    // Apply hairpin loop modifications.
     for _ in 0..n_hloop_indels {
-        (pos_seq, pos_struct, mod_counts) = modify_loop_region(
-            pos_seq,
-            pos_struct,
-            &args,
-            "hairpin",
-            &mut mod_counts,
-            rebuild_bg,
-        );
+        let (new_seq, new_struct, new_mod_counts) =
+            modify_loop_region(pos_seq, pos_struct, args, "hairpin", &mut mod_counts, &rebuild_bg);
+        pos_seq = new_seq;
+        pos_struct = new_struct;
+        mod_counts = new_mod_counts;
     }
-    // Modify internal loops
+    // Apply internal loop modifications.
     for _ in 0..n_iloop_indels {
-        (pos_seq, pos_struct, mod_counts) = modify_loop_region(
-            pos_seq,
-            pos_struct,
-            &args,
-            "internal",
-            &mut mod_counts,
-            rebuild_bg,
-        );
+        let (new_seq, new_struct, new_mod_counts) =
+            modify_loop_region(pos_seq, pos_struct, args, "internal", &mut mod_counts, &rebuild_bg);
+        pos_seq = new_seq;
+        pos_struct = new_struct;
+        mod_counts = new_mod_counts;
     }
-    // Modify bulges
+    // Apply bulge modifications.
     for _ in 0..n_bulge_indels {
-        (pos_seq, pos_struct, mod_counts) = modify_loop_region(
-            pos_seq,
-            pos_struct,
-            &args,
-            "bulge",
-            &mut mod_counts,
-            rebuild_bg,
-        );
+        let (new_seq, new_struct, new_mod_counts) =
+            modify_loop_region(pos_seq, pos_struct, args, "bulge", &mut mod_counts, &rebuild_bg);
+        pos_seq = new_seq;
+        pos_struct = new_struct;
+        mod_counts = new_mod_counts;
     }
-    // Modify multi loops
+    // Apply multi loop modifications.
     for _ in 0..n_mloop_indels {
-        (pos_seq, pos_struct, mod_counts) = modify_loop_region(
-            pos_seq,
-            pos_struct,
-            &args,
-            "multi",
-            &mut mod_counts,
-            rebuild_bg,
-        );
+        let (new_seq, new_struct, new_mod_counts) =
+            modify_loop_region(pos_seq, pos_struct, args, "multi", &mut mod_counts, &rebuild_bg);
+        pos_seq = new_seq;
+        pos_struct = new_struct;
+        mod_counts = new_mod_counts;
     }
 
     (pos_seq, pos_struct)
@@ -429,8 +407,7 @@ fn modify_stem<F>(
 where
     F: Fn(&str, &mut String) -> BulgeGraph,
 {
-    let mut pos_seq = seq;
-    let mut pos_struct = structure;
+    let mut pos_seq = seq;    let mut pos_struct = structure;
 
     // build or rebuild the bulge graph
     let bg = rebuild_bg(&pos_seq, &mut pos_struct);
