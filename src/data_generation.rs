@@ -443,26 +443,52 @@ where
     let coords = node_map.get(&node_name).unwrap();
     let current_size = coords.len();
     let action = choose_action(current_size, args.stem_min_size, args.stem_max_size);
-    // we approximate the "middle" of the stem for insertion
-    let mid_idx = coords[current_size / 2].saturating_sub(1); // to 0-based
-
     match action {
         ModAction::Insert => {
-            // We'll attempt to insert a pair around mid. But for simplicity, let's just insert a single base pair if feasible.
-            // Actually, let's do the simpler approach: we insert 2 bases, one in the "paired" region
-            // Because the python code is quite complicated, let's do a simpler approach:
-            // Insert a single base in the middle, then also insert a complementary base near the partner if it exists.
-
-            // For the "partner" we find the partner index from the current structure
-            // But we can't easily get that without re-parsing. Alternatively, we do a single base insertion in the middle and re-fold.
-            insert_base(&mut pos_seq, &mut pos_struct, mid_idx);
+            // NEW: perform paired insertion
+            let mut sorted_coords = coords.clone();
+            sorted_coords.sort();
+            let n = sorted_coords.len();
+            // Split into left and right halves (assume even number; if odd, use floor for left half)
+            let left_half = &sorted_coords[..n/2];
+            let right_half = &sorted_coords[n/2..];
+            // Convert 1-based indices to 0-based:
+            let left_last = left_half[left_half.len()-1].saturating_sub(1);
+            let right_first = right_half[0].saturating_sub(1);
+            // Determine insertion positions:
+            let ins_left = left_last + 1; // insert after the last left base
+            let ins_right = right_first;  // insert before the first right base
+            let complement_pairs = [('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G')];
+            let (base_left, base_right) = complement_pairs[thread_rng().gen_range(0..complement_pairs.len())];
+            // Insert at the higher index first:
+            if ins_left < ins_right {
+                pos_seq.insert(ins_right, base_right);
+                pos_struct.insert(ins_right, ')');
+                pos_seq.insert(ins_left, base_left);
+                pos_struct.insert(ins_left, '(');
+            } else {
+                pos_seq.insert(ins_left, base_left);
+                pos_struct.insert(ins_left, '(');
+                pos_seq.insert(ins_right, base_right);
+                pos_struct.insert(ins_right, ')');
+            }
         }
         ModAction::Delete => {
-            // delete one base from roughly the middle
-            if current_size > args.stem_min_size {
-                let del_idx = coords[current_size / 2].saturating_sub(1);
-                if del_idx < pos_seq.len() {
-                    delete_base(&mut pos_seq, &mut pos_struct, del_idx);
+            // NEW: perform paired deletion if possible
+            let mut sorted_coords = coords.clone();
+            sorted_coords.sort();
+            let n = sorted_coords.len();
+            if n < 2 {
+                // Nothing to delete in pairs.
+            } else {
+                let left_idx = sorted_coords[n/2 - 1].saturating_sub(1);  // 0-based
+                let right_idx = sorted_coords[n/2].saturating_sub(1);       // 0-based
+                // Remove higher index first:
+                if right_idx > left_idx && right_idx < pos_seq.len() {
+                    pos_seq.remove(right_idx);
+                    pos_struct.remove(right_idx);
+                    pos_seq.remove(left_idx);
+                    pos_struct.remove(left_idx);
                 }
             }
         }
@@ -586,7 +612,6 @@ fn maybe_append_sequences(
 ) {
     let mut rng = thread_rng();
     if rng.gen_bool(args.appending_event_probability) {
-        // decide left-only, right-only or both
         let r = rng.gen_range(0.0..1.0);
         let p_both = args.both_sides_appending_probability;
         let p_left = (1.0 - p_both) / 2.0;
@@ -595,21 +620,21 @@ fn maybe_append_sequences(
         let mean_append = anchor_len as f64 * args.appending_size_factor;
         let sigma_append = mean_append / 2.0;
 
-        // Define a helper that takes &mut rng so that we do not capture it mutably.
         let sample_append_length = |rng: &mut _| {
             let gauss = Normal::new(mean_append, sigma_append.max(1.0)).unwrap();
             gauss.sample(rng).round().max(1.0) as usize
         };
 
-        // Now use rng as usual (no conflict)
         let linker_len = rng.gen_range(args.linker_min..=args.linker_max);
         let linker_seq = generate_random_rna(linker_len);
+        // Do not fold the linker: use dots as structure.
         let linker_struct = ".".repeat(linker_len);
 
         if r < p_left {
             let l_app = sample_append_length(&mut rng);
             let appended_left_seq = generate_random_rna(l_app);
-            let appended_left_struct = ".".repeat(l_app);
+            let appended_left_struct =
+                fold_rna(&appended_left_seq).unwrap_or(".".repeat(l_app));
             *pos_seq = format!("{}{}{}", appended_left_seq, linker_seq, pos_seq);
             *pos_struct = format!("{}{}{}", appended_left_struct, linker_struct, pos_struct);
             *neg_seq = format!("{}{}{}", appended_left_seq, linker_seq, neg_seq);
@@ -617,7 +642,8 @@ fn maybe_append_sequences(
         } else if r < p_left + p_right {
             let r_app = sample_append_length(&mut rng);
             let appended_right_seq = generate_random_rna(r_app);
-            let appended_right_struct = ".".repeat(r_app);
+            let appended_right_struct =
+                fold_rna(&appended_right_seq).unwrap_or(".".repeat(r_app));
             *pos_seq = format!("{}{}{}", pos_seq, linker_seq, appended_right_seq);
             *pos_struct = format!("{}{}{}", pos_struct, linker_struct, appended_right_struct);
             *neg_seq = format!("{}{}{}", neg_seq, linker_seq, appended_right_seq);
@@ -625,10 +651,12 @@ fn maybe_append_sequences(
         } else {
             let l_app = sample_append_length(&mut rng);
             let appended_left_seq = generate_random_rna(l_app);
-            let appended_left_struct = ".".repeat(l_app);
+            let appended_left_struct =
+                fold_rna(&appended_left_seq).unwrap_or(".".repeat(l_app));
             let r_app = sample_append_length(&mut rng);
             let appended_right_seq = generate_random_rna(r_app);
-            let appended_right_struct = ".".repeat(r_app);
+            let appended_right_struct =
+                fold_rna(&appended_right_seq).unwrap_or(".".repeat(r_app));
             *pos_seq = format!(
                 "{}{}{}{}{}",
                 appended_left_seq, linker_seq, pos_seq, linker_seq, appended_right_seq
@@ -657,9 +685,10 @@ pub fn generate_triplet(args: &Cli) -> RnaTripletRecord {
     // 2) Generate positive
     let (mut pos_seq, mut pos_struct) = generate_positive(&anchor_seq, &anchor_structure, args);
 
-    // 3) Generate negative
-    let (mut neg_seq, mut neg_struct) =
+    // 3) Generate negative; ignore the placeholder structure.
+    let (mut neg_seq, _) =
         generate_negative_sample(&anchor_seq, args.neg_len_variation);
+    let mut neg_struct = fold_rna(&neg_seq).unwrap_or(".".repeat(neg_seq.len()));
 
     // 4) Maybe do “appending event”
     maybe_append_sequences(
@@ -674,11 +703,11 @@ pub fn generate_triplet(args: &Cli) -> RnaTripletRecord {
     RnaTripletRecord {
         triplet_id: 0, // we’ll set the real ID later
         anchor_seq,
-        anchor_structure, // placeholder; to be updated in batch below
+        anchor_structure,
         positive_seq: pos_seq,
         positive_structure: pos_struct,
         negative_seq: neg_seq,
-        negative_structure: neg_struct, // placeholder
+        negative_structure: neg_struct,
     }
 }
 
@@ -754,7 +783,8 @@ pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
                 batch_triplets.push(triplet);
             }
 
-            // Batch fold anchors.
+            // Remove re-folding of anchors since the anchor structure does not change.
+            /*
             let anchor_pairs: Vec<(String, String)> = batch_triplets.iter()
                 .map(|r| (format!("A{}", r.triplet_id), r.anchor_seq.clone()))
                 .collect();
@@ -765,8 +795,9 @@ pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
                     }
                 }
             }
-
-            // Batch fold negatives.
+            */
+            // DO NOT fold negatives: keep the appended structure.
+            /*
             let neg_pairs: Vec<(String, String)> = batch_triplets.iter()
                 .map(|r| (format!("N{}", r.triplet_id), r.negative_seq.clone()))
                 .collect();
@@ -777,6 +808,7 @@ pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
                     }
                 }
             }
+            */
 
             pb.inc(cur_size as u64);
             batch_triplets
@@ -842,6 +874,8 @@ pub fn build_metadata(args: &Cli) -> serde_json::Value {
 }
 
 // ----- New function: batched RNAfold -----
+// Add an attribute to suppress the dead code warning.
+#[allow(dead_code)]
 pub fn fold_rna_batch(sequences: &[(String, String)]) -> Result<HashMap<String, String>, String> {
     // Build multi-FASTA input. Each entry: ">ID\nSEQUENCE"
     let input = sequences.iter()

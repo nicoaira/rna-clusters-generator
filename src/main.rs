@@ -270,16 +270,20 @@ r#"rnartist {{
             let anchor_png = temp_dir.join(format!("triplet_{}_anchor.png", triplet.triplet_id));
             let positive_png = temp_dir.join(format!("triplet_{}_positive.png", triplet.triplet_id));
             let negative_png = temp_dir.join(format!("triplet_{}_negative.png", triplet.triplet_id));
+            // Check that all files exist.
+            if !(anchor_png.exists() && positive_png.exists() && negative_png.exists()) {
+                eprintln!("One or more images for triplet {} not found. Skipping montage.", triplet.triplet_id);
+                continue;
+            }
             let composite_path = plot_dir.join(format!("triplet_{}.png", triplet.triplet_id));
-            let montage_status = Command::new("montage")
+            let montage_status = std::process::Command::new("montage")
                 .args(&[
                     anchor_png.to_string_lossy().as_ref(),
                     positive_png.to_string_lossy().as_ref(),
                     negative_png.to_string_lossy().as_ref(),
                     "-tile", "3x1",
                     "-geometry", "+10+10",
-                    composite_path.to_string_lossy().as_ref(),
-                ])
+                    composite_path.to_string_lossy().as_ref(),                ])
                 .status()
                 .expect("Failed to execute montage command");
             if !montage_status.success() {
