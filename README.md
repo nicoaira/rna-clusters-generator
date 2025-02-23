@@ -22,4 +22,126 @@ This project is a Rust-based RNA triplet dataset generator that mimics the origi
 
 ## Usage Example
 
-You can run the program with the following full set of command-line arguments:
+You can run the program with the following command:
+
+```bash
+cargo run -- \
+  --num-structures 300 \
+  --seq-min-len 40 \
+  --seq-max-len 600 \
+  --seq-len-distribution norm \
+  --seq-len-mean 300 \
+  --seq-len-sd 100 \
+  --mod-normalization \
+  --normalization-len 50 \
+  --neg-len-variation 20 \
+  --n-stem-indels 2 \
+  --stem-max-size 14 \
+  --stem-min-size 3 \
+  --stem-max-n-modifications 1 \
+  --n-hloop-indels 2 \
+  --hloop-min-size 1 \
+  --hloop-max-size 10 \
+  --hloop-max-n-modifications 1 \
+  --n-iloop-indels 2 \
+  --iloop-min-size 2 \
+  --iloop-max-size 10 \
+  --iloop-max-n-modifications 1 \
+  --n-bulge-indels 2 \
+  --bulge-min-size 1 \
+  --bulge-max-size 8 \
+  --bulge-max-n-modifications 1 \
+  --n-mloop-indels 2 \
+  --mloop-min-size 2 \
+  --mloop-max-size 15 \
+  --mloop-max-n-modifications 1 \
+  --num-workers 12 \
+  --output-dir output-2102-rust \
+  --split \
+  --train-fraction 0.97 \
+  --val-fraction 0.03 \
+  --plot \
+  --num-plots 50 \
+  --batch-size 64
+```
+
+## Parameters Explanation
+
+### Sequence Generation Parameters
+- `--num-structures`: Number of RNA structures to generate (300 in example)
+- `--seq-min-len`: Minimum sequence length (40 bases)
+- `--seq-max-len`: Maximum sequence length (600 bases)
+- `--seq-len-distribution`: Distribution type for sequence length (`norm` for normal distribution)
+- `--seq-len-mean`: Mean sequence length for normal distribution (300)
+- `--seq-len-sd`: Standard deviation for sequence length (100)
+- `--neg-len-variation`: Maximum length variation (+/-) for negative samples (20)
+
+### Modification Control
+- `--mod-normalization`: Enable length-based modification count normalization
+- `--normalization-len`: Reference length for normalization (50)
+
+### Stem Parameters
+- `--n-stem-indels`: Number of stem modifications to apply (2)
+- `--stem-min-size`: Minimum stem size (3 base pairs)
+- `--stem-max-size`: Maximum stem size (14 base pairs)
+- `--stem-max-n-modifications`: Maximum modifications per stem (1)
+
+### Hairpin Loop Parameters
+- `--n-hloop-indels`: Number of hairpin loop modifications (2)
+- `--hloop-min-size`: Minimum hairpin loop size (1)
+- `--hloop-max-size`: Maximum hairpin loop size (10)
+- `--hloop-max-n-modifications`: Maximum modifications per hairpin (1)
+
+### Internal Loop Parameters
+- `--n-iloop-indels`: Number of internal loop modifications (2)
+- `--iloop-min-size`: Minimum internal loop size (2)
+- `--iloop-max-size`: Maximum internal loop size (10)
+- `--iloop-max-n-modifications`: Maximum modifications per internal loop (1)
+
+### Bulge Parameters
+- `--n-bulge-indels`: Number of bulge modifications (2)
+- `--bulge-min-size`: Minimum bulge size (1)
+- `--bulge-max-size`: Maximum bulge size (8)
+- `--bulge-max-n-modifications`: Maximum modifications per bulge (1)
+
+### Multiloop Parameters
+- `--n-mloop-indels`: Number of multiloop modifications (2)
+- `--mloop-min-size`: Minimum multiloop size (2)
+- `--mloop-max-size`: Maximum multiloop size (15)
+- `--mloop-max-n-modifications`: Maximum modifications per multiloop (1)
+
+### Performance Parameters
+- `--num-workers`: Number of parallel worker threads (12)
+- `--batch-size`: Number of structures to process per batch (64)
+- `--output-dir`: Directory for output files (output-2102-rust)
+
+### Dataset Split Parameters
+- `--split`: Enable dataset splitting into train/validation sets
+- `--train-fraction`: Fraction of data for training set (0.97)
+- `--val-fraction`: Fraction of data for validation set (0.03)
+
+### Visualization Parameters
+- `--plot`: Enable structure plotting
+- `--num-plots`: Number of structures to plot (50)
+
+// ...existing code until Requirements section...
+
+## Requirements
+
+You can install requirements with
+
+```
+chmod +x install_requirements.sh
+sudo ./install_requirements.sh
+```
+
+### RNAfold
+- Install ViennaRNA package from https://www.tbi.univie.ac.at/RNA 
+- Ensure that `RNAfold` is accessible in your PATH
+- On Ubuntu/Debian, you can install via: `sudo apt install vienna-rna`
+- On macOS with Homebrew: `brew install viennarna`
+- For other systems, follow the installation guide at https://www.tbi.univie.ac.at/RNA/#download
+
+### Other Requirements
+- **ImageMagick**: For merging plots (`montage` command)
+- **Rust Toolchain**: Install Rust and Cargo to build and run this project
