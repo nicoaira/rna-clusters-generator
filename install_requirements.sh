@@ -33,9 +33,21 @@ install_vienna_rna() {
     fi
 }
 
-# Install Java and ViennaRNA
+# Function to install Rust using rustup
+install_rust() {
+    if ! command -v rustc &> /dev/null; then
+        echo "Rust is not installed. Installing Rust using rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        export PATH="$HOME/.cargo/bin:$PATH"
+    else
+        echo "Rust is already installed."
+    fi
+}
+
+# Install Java, ViennaRNA, and Rust
 install_java
 install_vienna_rna
+install_rust
 
 # Check if wget or curl is available for downloading
 if command -v wget &> /dev/null; then
@@ -65,12 +77,19 @@ echo "java -jar $INSTALL_DIR/$JAR_NAME \"\$@\"" >> "$INSTALL_DIR/$SCRIPT_NAME"
 # Make the script executable
 chmod +x "$INSTALL_DIR/$SCRIPT_NAME"
 
-# Add ~/.local/bin to PATH if not already present
+# Add ~/.local/bin and Rust to PATH if not already present
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo "Adding $INSTALL_DIR to PATH..."
     echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$HOME/.bashrc"
     echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$HOME/.zshrc"  # For zsh users
     export PATH="$INSTALL_DIR:$PATH"
+fi
+
+if [[ ":$PATH:" != *"$HOME/.cargo/bin"* ]]; then
+    echo "Adding Rust to PATH..."
+    echo "export PATH=\"$HOME/.cargo/bin:\$PATH\"" >> "$HOME/.bashrc"
+    echo "export PATH=\"$HOME/.cargo/bin:\$PATH\"" >> "$HOME/.zshrc"
+    export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 # Verify installation
