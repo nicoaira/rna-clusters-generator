@@ -1,6 +1,6 @@
 # RNA Cluster Dataset Generator
 
-This project is a Rust-based RNA cluster dataset generator. Instead of triplets (anchor/positive/negative), it creates clusters with one anchor and multiple positive (modified) structures per cluster. For example, if you choose 50 clusters and 200 structures per cluster, the program will generate 50 anchor structures and for each anchor it will produce 200 “positive” structures by introducing noise.
+This project is a Rust-based RNA cluster dataset generator. Unlike earlier versions that generated triplets (anchor/positive/negative), this version creates clusters with one anchor and multiple positive (modified) structures per cluster. For example, if you choose 50 clusters and 100 structures per cluster, the program will generate 50 anchor structures and for each anchor produce 99 positive structures by introducing modifications.
 
 ## Usage Example
 
@@ -36,10 +36,7 @@ cargo run -- \
   --mloop-max-size 15 \
   --mloop-max-n-modifications 1 \
   --num-workers 12 \
-  --batch-size 64 \
-  --split \
-  --train-fraction 0.97 \
-  --val-fraction 0.03
+  --batch-size 64
 ```
 
 ## Parameters Explanation
