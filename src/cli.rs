@@ -16,16 +16,23 @@ pub enum SeqLenDistribution {
 #[command(
     name = "rna_generator",
     version,
-    about = "Generate RNA triplets (anchor/positive/negative) with modifications."
+    about = "Generate RNA clusters (one anchor per cluster with multiple positives)."
 )]
 pub struct Cli {
     // ----------------------
+    // Cluster Generation
+    // ----------------------
+    /// Number of clusters (each cluster has one anchor structure)
+    #[arg(long)]
+    pub n_clusters: usize,
+
+    /// Number of positive structures per cluster
+    #[arg(long)]
+    pub structures_per_cluster: usize,
+
+    // ----------------------
     // Sequence Generation
     // ----------------------
-    /// Number of structures (anchors) to generate
-    #[arg(long, default_value_t = 100)]
-    pub num_structures: usize,
-
     /// Minimum sequence length
     #[arg(long, default_value_t = 50)]
     pub seq_min_len: usize,
@@ -45,10 +52,6 @@ pub struct Cli {
     /// Standard deviation for normal distribution of sequence length
     #[arg(long, default_value_t = 10.0)]
     pub seq_len_sd: f64,
-
-    /// Maximum length variation for negative structures
-    #[arg(long, default_value_t = 0)]
-    pub neg_len_variation: isize,
 
     // ----------------------
     // Stem Modifications
@@ -143,40 +146,6 @@ pub struct Cli {
     pub mloop_max_n_modifications: usize,
 
     // ----------------------
-    // Appending Parameters
-    // ----------------------
-    /// Probability that an appending event will occur for a triplet
-    #[arg(long, default_value_t = 0.3)]
-    pub appending_event_probability: f64,
-
-    /// Probability to append on both sides (otherwise left or right)
-    #[arg(long, default_value_t = 0.33)]
-    pub both_sides_appending_probability: f64,
-
-    /// Minimum linker length (in bases) for appending event
-    #[arg(long, default_value_t = 2)]
-    pub linker_min: usize,
-
-    /// Maximum linker length (in bases) for appending event
-    #[arg(long, default_value_t = 8)]
-    pub linker_max: usize,
-
-    /// Factor to multiply the anchor length for appended RNA length sampling
-    #[arg(long, default_value_t = 1.0)]
-    pub appending_size_factor: f64,
-
-    // ----------------------
-    // Modification Normalization
-    // ----------------------
-    /// Enable normalization of modification counts based on anchor length
-    #[arg(long, default_value_t = false)]
-    pub mod_normalization: bool,
-
-    /// Normalization length to scale modifications (default: 100)
-    #[arg(long, default_value_t = 100)]
-    pub normalization_len: usize,
-
-    // ----------------------
     // Performance & Output
     // ----------------------
     /// Number of parallel workers
@@ -187,7 +156,7 @@ pub struct Cli {
     #[arg(long, default_value_t = String::from("output"))]
     pub output_dir: String,
 
-    /// Number of triplets to generate per worker batch
+    /// Number of triplets per worker batch (now used for clusters)
     #[arg(long, default_value_t = 64)]
     pub batch_size: usize,
 
@@ -201,21 +170,6 @@ pub struct Cli {
     /// Number of triplets to plot (no-op in Rust version)
     #[arg(long, default_value_t = 5)]
     pub num_plots: usize,
-
-    // ----------------------
-    // Dataset Splitting
-    // ----------------------
-    /// Enable splitting the dataset into train/val sets
-    #[arg(long, default_value_t = false)]
-    pub split: bool,
-
-    /// Fraction of data for training
-    #[arg(long)]
-    pub train_fraction: Option<f64>,
-
-    /// Fraction of data for validation
-    #[arg(long)]
-    pub val_fraction: Option<f64>,
 
     // ----------------------
     // Misc / Debug

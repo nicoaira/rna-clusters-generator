@@ -8,32 +8,26 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{Write, BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader};
 
-use chrono::Local;
 use rand::distributions::{Distribution, Uniform};
 use rand::{thread_rng, Rng};
 use rand_distr::Normal;
 use serde::Serialize;
-use uuid::Uuid;
 use rand::seq::SliceRandom;
 
 
 use crate::bulgegraph::BulgeGraph;
 use crate::cli::{Cli, SeqLenDistribution};
 
-/// A single record in our final CSV (equivalent to one "triplet").
+/// New record type for cluster datasets (no negative sample)
 #[derive(Debug, Serialize, Clone)]
-pub struct RnaTripletRecord {
-    pub triplet_id: usize,
-    pub anchor_seq: String,
-    pub anchor_structure: String,
-    pub positive_seq: String,
-    pub positive_structure: String,
-    pub negative_seq: String,
-    pub negative_structure: String,
+pub struct RnaClusterRecord {
+    pub cluster: usize,
+    pub seq: String,
+    pub structure: String,
+    pub anchor: u8, // 1 for anchor, 0 for positive
 }
 
 /// Generate a random RNA sequence of the given length (uniform distribution of {A,C,G,U}).
@@ -133,6 +127,7 @@ pub fn choose_seq_length(
 // ============ Negative sample via dinuc shuffle ============
 
 /// Return a new sequence that preserves the original dinucleotide frequencies.
+#[allow(dead_code)]
 pub fn dinuc_shuffle(seq: &str) -> String {
     if seq.len() <= 1 {
         return seq.to_string();
@@ -177,6 +172,7 @@ pub fn dinuc_shuffle(seq: &str) -> String {
 }
 
 /// Generate a negative sample by dinuc shuffling and optional length variation.
+#[allow(dead_code)]
 pub fn generate_negative_sample(seq: &str, allowed_variation: isize) -> (String, String) {
     let mut rng = thread_rng();
     let mut new_seq = dinuc_shuffle(seq);
@@ -317,6 +313,170 @@ pub fn generate_anchor(args: &Cli) -> (String, String) {
     (anchor_seq, anchor_structure)
 }
 
+/// Modify a stem node: choose a random eligible stem and perform an insertion or deletion.
+fn modify_stem<F>(
+    seq: String,
+    structure: String,
+    args: &Cli,
+    mod_counts: &mut HashMap<String, usize>,
+    rebuild_bg: F,
+) -> (String, String, HashMap<String, usize>)
+where
+    F: Fn(&str, &mut String) -> BulgeGraph,
+{
+    let mut pos_seq = seq;
+    let mut pos_struct = structure;
+
+    // Rebuild the bulge graph to get node mapping.
+    let bg = rebuild_bg(&pos_seq, &mut pos_struct);
+    let node_map = bg.node_mapping();
+
+    let eligible_nodes: Vec<String> = node_map
+        .iter()
+        .filter_map(|(node_name, coords)| {
+            if let NodeType::Stem = classify_node(node_name, coords) {
+                let count = mod_counts.get(node_name).copied().unwrap_or(0);
+                if count < args.stem_max_n_modifications && coords.len() >= args.stem_min_size {
+                    Some(node_name.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if eligible_nodes.is_empty() {
+        return (pos_seq, pos_struct, mod_counts.clone());
+    }
+
+    // Pick a random eligible stem.
+    let node_name = eligible_nodes[thread_rng().gen_range(0..eligible_nodes.len())].clone();
+    let coords = node_map.get(&node_name).unwrap();
+    let current_size = coords.len();
+    let action = choose_action(current_size, args.stem_min_size, args.stem_max_size);
+    match action {
+        ModAction::Insert => {
+            let mut sorted_coords = coords.clone();
+            sorted_coords.sort();
+            let n = sorted_coords.len();
+            let left_half = &sorted_coords[..n/2];
+            let right_half = &sorted_coords[n/2..];
+            let left_last = left_half[left_half.len()-1].saturating_sub(1);
+            let right_first = right_half[0].saturating_sub(1);
+            let ins_left = left_last + 1; // <-- NEW: define insertion point for left side
+            let complement_pairs = [('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G')];
+            let (base_left, base_right) = complement_pairs[thread_rng().gen_range(0..complement_pairs.len())];
+            if ins_left < right_first {
+                pos_seq.insert(right_first, base_right);
+                pos_struct.insert(right_first, ')');
+                pos_seq.insert(ins_left, base_left);
+                pos_struct.insert(ins_left, '(');
+            } else {
+                pos_seq.insert(ins_left, base_left);
+                pos_struct.insert(ins_left, '(');
+                pos_seq.insert(right_first, base_right);
+                pos_struct.insert(right_first, ')');
+            }
+        }
+        ModAction::Delete => {
+            let mut sorted_coords = coords.clone();
+            sorted_coords.sort();
+            let n = sorted_coords.len();
+            if n >= 2 {
+                let left_idx = sorted_coords[n/2 - 1].saturating_sub(1);
+                let right_idx = sorted_coords[n/2].saturating_sub(1);
+                if right_idx > left_idx && right_idx < pos_seq.len() {
+                    pos_seq.remove(right_idx);
+                    pos_struct.remove(right_idx);
+                    pos_seq.remove(left_idx);
+                    pos_struct.remove(left_idx);
+                }
+            }
+        }
+    }
+    *mod_counts.entry(node_name).or_default() += 1;
+    (pos_seq, pos_struct, mod_counts.clone())
+}
+
+/// Modify a loop region (hairpin/internal/bulge/multi) by selecting an eligible node and performing an insertion or deletion.
+fn modify_loop_region<F>(
+    seq: String,
+    structure: String,
+    args: &Cli,
+    loop_type: &str,
+    mod_counts: &mut HashMap<String, usize>,
+    rebuild_bg: F,
+) -> (String, String, HashMap<String, usize>)
+where
+    F: Fn(&str, &mut String) -> BulgeGraph,
+{
+    let mut pos_seq = seq;
+    let mut pos_struct = structure;
+    let bg = rebuild_bg(&pos_seq, &mut pos_struct);
+    let node_map = bg.node_mapping();
+
+    // Determine constraints based on loop type.
+    let (min_size, max_size, max_mods) = match loop_type {
+        "hairpin" => (args.hloop_min_size, args.hloop_max_size, args.hloop_max_n_modifications),
+        "internal" => (args.iloop_min_size, args.iloop_max_size, args.iloop_max_n_modifications),
+        "bulge" => (args.bulge_min_size, args.bulge_max_size, args.bulge_max_n_modifications),
+        "multi" => (args.mloop_min_size, args.mloop_max_size, args.mloop_max_n_modifications),
+        _ => (1, 9999, 1),
+    };
+
+    let required_type = match loop_type {
+        "hairpin" => NodeType::Hairpin,
+        "internal" => NodeType::Internal,
+        "bulge" => NodeType::Bulge,
+        "multi" => NodeType::Multi,
+        _ => NodeType::Unknown,
+    };
+
+    let eligible_nodes: Vec<String> = node_map
+        .iter()
+        .filter_map(|(node_name, coords)| {
+            if classify_node(node_name, coords) == required_type {
+                let cur_size = coords.len();
+                let count = mod_counts.get(node_name).copied().unwrap_or(0);
+                if count < max_mods && cur_size >= min_size && cur_size <= max_size {
+                    Some(node_name.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if eligible_nodes.is_empty() {
+        return (pos_seq, pos_struct, mod_counts.clone());
+    }
+
+    let node_name = eligible_nodes[thread_rng().gen_range(0..eligible_nodes.len())].clone();
+    let coords = node_map.get(&node_name).unwrap();
+    let current_size = coords.len();
+    let action = choose_action(current_size, min_size, max_size);
+    match action {
+        ModAction::Insert => {
+            let idx = coords[thread_rng().gen_range(0..coords.len())].saturating_sub(1);
+            insert_base(&mut pos_seq, &mut pos_struct, idx);
+        }
+        ModAction::Delete => {
+            if current_size > min_size {
+                let idx = coords[thread_rng().gen_range(0..coords.len())].saturating_sub(1);
+                if idx < pos_seq.len() {
+                    delete_base(&mut pos_seq, &mut pos_struct, idx);
+                }
+            }
+        }
+    }
+    *mod_counts.entry(node_name).or_default() += 1;
+    (pos_seq, pos_struct, mod_counts.clone())
+}
+
 /// Generate a positive sample from an existing anchor by applying modifications.
 pub fn generate_positive(
     anchor_seq: &str,
@@ -326,25 +486,14 @@ pub fn generate_positive(
     let mut pos_seq = anchor_seq.to_string();
     let mut pos_struct = anchor_structure.to_string();
 
-    let length = anchor_seq.len();
-    let mut n_stem_indels = args.n_stem_indels;
-    let mut n_hloop_indels = args.n_hloop_indels;
-    let mut n_iloop_indels = args.n_iloop_indels;
-    let mut n_bulge_indels = args.n_bulge_indels;
-    let mut n_mloop_indels = args.n_mloop_indels;
-
-    // Normalize modification counts if enabled.
-    if args.mod_normalization {
-        let factor = (length as f64 / args.normalization_len as f64).max(1.0);
-        let scale = |val: usize| -> usize {
-            if val <= 1 { val } else { ((val as f64) * factor).round() as usize }
-        };
-        n_stem_indels = scale(n_stem_indels);
-        n_hloop_indels = scale(n_hloop_indels);
-        n_iloop_indels = scale(n_iloop_indels);
-        n_bulge_indels = scale(n_bulge_indels);
-        n_mloop_indels = scale(n_mloop_indels);
-    }
+    // Rename unused variable "length" to "_length"
+    let _length = anchor_seq.len();
+    // Remove unnecessary mut on local counters:
+    let n_stem_indels = args.n_stem_indels;
+    let n_hloop_indels = args.n_hloop_indels;
+    let n_iloop_indels = args.n_iloop_indels;
+    let n_bulge_indels = args.n_bulge_indels;
+    let n_mloop_indels = args.n_mloop_indels;
 
     let mut mod_counts: HashMap<String, usize> = HashMap::new();
     // Define a rebuild closure that builds the bulge graph from the current structure.
@@ -396,354 +545,77 @@ pub fn generate_positive(
     (pos_seq, pos_struct)
 }
 
-/// Modify stems: choose a random stem node that is not yet at max modifications, do insert/delete.
-fn modify_stem<F>(
-    seq: String,
-    structure: String,
-    args: &Cli,
-    mod_counts: &mut HashMap<String, usize>,
-    rebuild_bg: F,
-) -> (String, String, HashMap<String, usize>)
-where
-    F: Fn(&str, &mut String) -> BulgeGraph,
-{
-    let mut pos_seq = seq;    let mut pos_struct = structure;
-
-    // build or rebuild the bulge graph
-    let bg = rebuild_bg(&pos_seq, &mut pos_struct);
-
-    // gather stems that still can be modified
-    let node_map = bg.node_mapping();
-    let eligible_nodes: Vec<_> = node_map
-        .iter()
-        .filter_map(|(node_name, coords)| {
-            if classify_node(node_name, coords) == crate::data_generation::NodeType::Stem {
-                let count = mod_counts.get(node_name).copied().unwrap_or(0);
-                if count < args.stem_max_n_modifications && coords.len() >= args.stem_min_size {
-                    Some(node_name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if eligible_nodes.is_empty() {
-        // no stems or none are eligible
-        return (pos_seq, pos_struct, mod_counts.clone());
-    }
-
-    // pick a random node from the eligible set
-    let node_name = eligible_nodes
-        [thread_rng().gen_range(0..eligible_nodes.len())]
-        .clone();
-
-    let coords = node_map.get(&node_name).unwrap();
-    let current_size = coords.len();
-    let action = choose_action(current_size, args.stem_min_size, args.stem_max_size);
-    match action {
-        ModAction::Insert => {
-            // NEW: perform paired insertion
-            let mut sorted_coords = coords.clone();
-            sorted_coords.sort();
-            let n = sorted_coords.len();
-            // Split into left and right halves (assume even number; if odd, use floor for left half)
-            let left_half = &sorted_coords[..n/2];
-            let right_half = &sorted_coords[n/2..];
-            // Convert 1-based indices to 0-based:
-            let left_last = left_half[left_half.len()-1].saturating_sub(1);
-            let right_first = right_half[0].saturating_sub(1);
-            // Determine insertion positions:
-            let ins_left = left_last + 1; // insert after the last left base
-            let ins_right = right_first;  // insert before the first right base
-            let complement_pairs = [('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G')];
-            let (base_left, base_right) = complement_pairs[thread_rng().gen_range(0..complement_pairs.len())];
-            // Insert at the higher index first:
-            if ins_left < ins_right {
-                pos_seq.insert(ins_right, base_right);
-                pos_struct.insert(ins_right, ')');
-                pos_seq.insert(ins_left, base_left);
-                pos_struct.insert(ins_left, '(');
-            } else {
-                pos_seq.insert(ins_left, base_left);
-                pos_struct.insert(ins_left, '(');
-                pos_seq.insert(ins_right, base_right);
-                pos_struct.insert(ins_right, ')');
-            }
-        }
-        ModAction::Delete => {
-            // NEW: perform paired deletion if possible
-            let mut sorted_coords = coords.clone();
-            sorted_coords.sort();
-            let n = sorted_coords.len();
-            if n < 2 {
-                // Nothing to delete in pairs.
-            } else {
-                let left_idx = sorted_coords[n/2 - 1].saturating_sub(1);  // 0-based
-                let right_idx = sorted_coords[n/2].saturating_sub(1);       // 0-based
-                // Remove higher index first:
-                if right_idx > left_idx && right_idx < pos_seq.len() {
-                    pos_seq.remove(right_idx);
-                    pos_struct.remove(right_idx);
-                    pos_seq.remove(left_idx);
-                    pos_struct.remove(left_idx);
-                }
-            }
-        }
-    }
-    *mod_counts.entry(node_name).or_default() += 1;
-    (pos_seq, pos_struct, mod_counts.clone())
-}
-
-/// Generic function to modify a loop region (hairpin, internal, bulge, multi).
-/// We'll pick a node from the appropriate type and do an insert or delete.
-fn modify_loop_region<F>(
-    seq: String,
-    structure: String,
-    args: &Cli,
-    loop_type: &str,
-    mod_counts: &mut HashMap<String, usize>,
-    rebuild_bg: F,
-) -> (String, String, HashMap<String, usize>)
-where
-    F: Fn(&str, &mut String) -> BulgeGraph,
-{
-    let mut pos_seq = seq;
-    let mut pos_struct = structure;
-    let bg = rebuild_bg(&pos_seq, &mut pos_struct);
-
-    let node_map = bg.node_mapping();
-
-    // figure out which node type we need
-    let (min_size, max_size, max_mods) = match loop_type {
-        "hairpin" => (
-            args.hloop_min_size,
-            args.hloop_max_size,
-            args.hloop_max_n_modifications,
-        ),
-        "internal" => (
-            args.iloop_min_size,
-            args.iloop_max_size,
-            args.iloop_max_n_modifications,
-        ),
-        "bulge" => (
-            args.bulge_min_size,
-            args.bulge_max_size,
-            args.bulge_max_n_modifications,
-        ),
-        "multi" => (
-            args.mloop_min_size,
-            args.mloop_max_size,
-            args.mloop_max_n_modifications,
-        ),
-        _ => (1, 9999, 1),
-    };
-
-    // gather appropriate node names
-    let required_node_type = match loop_type {
-        "hairpin" => NodeType::Hairpin,
-        "internal" => NodeType::Internal,
-        "bulge" => NodeType::Bulge,
-        "multi" => NodeType::Multi,
-        _ => NodeType::Unknown,
-    };
-
-    let eligible_nodes: Vec<_> = node_map
-        .iter()
-        .filter_map(|(node_name, coords)| {
-            let node_t = classify_node(node_name, coords);
-            if node_t == required_node_type {
-                // check if size, mod counts
-                let cur_size = coords.len();
-                let count = mod_counts.get(node_name).copied().unwrap_or(0);
-                if count < max_mods && cur_size >= min_size && cur_size <= max_size {
-                    Some(node_name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if eligible_nodes.is_empty() {
-        return (pos_seq, pos_struct, mod_counts.clone());
-    }
-
-    let node_name = eligible_nodes
-        [thread_rng().gen_range(0..eligible_nodes.len())]
-        .clone();
-    let coords = node_map.get(&node_name).unwrap();
-    let current_size = coords.len();
-    let action = choose_action(current_size, min_size, max_size);
-
-    match action {
-        ModAction::Insert => {
-            // choose random insertion position
-            let idx = coords[thread_rng().gen_range(0..coords.len())].saturating_sub(1);
-            insert_base(&mut pos_seq, &mut pos_struct, idx);
-        }
-        ModAction::Delete => {
-            // if current_size <= min_size, skip
-            if current_size > min_size {
-                let idx = coords[thread_rng().gen_range(0..coords.len())].saturating_sub(1);
-                if idx < pos_seq.len() {
-                    delete_base(&mut pos_seq, &mut pos_struct, idx);
-                }
-            }
-        }
-    }
-
-    *mod_counts.entry(node_name).or_default() += 1;
-    (pos_seq, pos_struct, mod_counts.clone())
-}
-
-/// Add “appending” to both positive and negative sequences if triggered.
-fn maybe_append_sequences(
-    pos_seq: &mut String,
-    pos_struct: &mut String,
-    neg_seq: &mut String,
-    neg_struct: &mut String,
-    anchor_len: usize,
-    args: &Cli,
-) {
-    let mut rng = thread_rng();
-    if rng.gen_bool(args.appending_event_probability) {
-        let r = rng.gen_range(0.0..1.0);
-        let p_both = args.both_sides_appending_probability;
-        let p_left = (1.0 - p_both) / 2.0;
-        let p_right = p_left;
-
-        let mean_append = anchor_len as f64 * args.appending_size_factor;
-        let sigma_append = mean_append / 2.0;
-
-        let sample_append_length = |rng: &mut _| {
-            let gauss = Normal::new(mean_append, sigma_append.max(1.0)).unwrap();
-            gauss.sample(rng).round().max(1.0) as usize
-        };
-
-        let linker_len = rng.gen_range(args.linker_min..=args.linker_max);
-        let linker_seq = generate_random_rna(linker_len);
-        // Do not fold the linker: use dots as structure.
-        let linker_struct = ".".repeat(linker_len);
-
-        if r < p_left {
-            let l_app = sample_append_length(&mut rng);
-            let appended_left_seq = generate_random_rna(l_app);
-            let appended_left_struct =
-                fold_rna(&appended_left_seq).unwrap_or(".".repeat(l_app));
-            *pos_seq = format!("{}{}{}", appended_left_seq, linker_seq, pos_seq);
-            *pos_struct = format!("{}{}{}", appended_left_struct, linker_struct, pos_struct);
-            *neg_seq = format!("{}{}{}", appended_left_seq, linker_seq, neg_seq);
-            *neg_struct = format!("{}{}{}", appended_left_struct, linker_struct, neg_struct);
-        } else if r < p_left + p_right {
-            let r_app = sample_append_length(&mut rng);
-            let appended_right_seq = generate_random_rna(r_app);
-            let appended_right_struct =
-                fold_rna(&appended_right_seq).unwrap_or(".".repeat(r_app));
-            *pos_seq = format!("{}{}{}", pos_seq, linker_seq, appended_right_seq);
-            *pos_struct = format!("{}{}{}", pos_struct, linker_struct, appended_right_struct);
-            *neg_seq = format!("{}{}{}", neg_seq, linker_seq, appended_right_seq);
-            *neg_struct = format!("{}{}{}", neg_struct, linker_struct, appended_right_struct);
-        } else {
-            let l_app = sample_append_length(&mut rng);
-            let appended_left_seq = generate_random_rna(l_app);
-            let appended_left_struct =
-                fold_rna(&appended_left_seq).unwrap_or(".".repeat(l_app));
-            let r_app = sample_append_length(&mut rng);
-            let appended_right_seq = generate_random_rna(r_app);
-            let appended_right_struct =
-                fold_rna(&appended_right_seq).unwrap_or(".".repeat(r_app));
-            *pos_seq = format!(
-                "{}{}{}{}{}",
-                appended_left_seq, linker_seq, pos_seq, linker_seq, appended_right_seq
-            );
-            *pos_struct = format!(
-                "{}{}{}{}{}",
-                appended_left_struct, linker_struct, pos_struct, linker_struct, appended_right_struct
-            );
-            *neg_seq = format!(
-                "{}{}{}{}{}",
-                appended_left_seq, linker_seq, neg_seq, linker_seq, appended_right_seq
-            );
-            *neg_struct = format!(
-                "{}{}{}{}{}",
-                appended_left_struct, linker_struct, neg_struct, linker_struct, appended_right_struct
-            );
-        }
-    }
-}
-
-/// Generate a single anchor/positive/negative triplet.
-pub fn generate_triplet(args: &Cli) -> RnaTripletRecord {
-    // 1) Generate anchor
+/// Generate a cluster: one anchor and multiple positives generated from it.
+pub fn generate_cluster(args: &Cli, cluster_id: usize) -> Vec<RnaClusterRecord> {
     let (anchor_seq, anchor_structure) = generate_anchor(args);
-
-    // 2) Generate positive
-    let (mut pos_seq, mut pos_struct) = generate_positive(&anchor_seq, &anchor_structure, args);
-
-    // 3) Generate negative; ignore the placeholder structure.
-    let (mut neg_seq, _) =
-        generate_negative_sample(&anchor_seq, args.neg_len_variation);
-    let mut neg_struct = fold_rna(&neg_seq).unwrap_or(".".repeat(neg_seq.len()));
-
-    // 4) Maybe do “appending event”
-    maybe_append_sequences(
-        &mut pos_seq,
-        &mut pos_struct,
-        &mut neg_seq,
-        &mut neg_struct,
-        anchor_seq.len(),
-        args,
-    );
-
-    RnaTripletRecord {
-        triplet_id: 0, // we’ll set the real ID later
-        anchor_seq,
-        anchor_structure,
-        positive_seq: pos_seq,
-        positive_structure: pos_struct,
-        negative_seq: neg_seq,
-        negative_structure: neg_struct,
+    let mut records = Vec::with_capacity(args.structures_per_cluster);
+    // Add the anchor record (flag 1)
+    records.push(RnaClusterRecord {
+        cluster: cluster_id,
+        seq: anchor_seq.clone(),
+        structure: anchor_structure.clone(),
+        anchor: 1,
+    });
+    // Generate (structures_per_cluster - 1) positive records (flag 0)
+    for _ in 1..args.structures_per_cluster {
+        let (pos_seq, pos_struct) = generate_positive(&anchor_seq, &anchor_structure, args);
+        records.push(RnaClusterRecord {
+            cluster: cluster_id,
+            seq: pos_seq,
+            structure: pos_struct,
+            anchor: 0,
+        });
     }
+    records
 }
 
-// ============ Splitting, Saving, and other I/O ============
+/// Generate all clusters in batches.
+pub fn generate_all_clusters(args: &Cli) -> Vec<RnaClusterRecord> {
+    use rayon::prelude::*;
+    let total_clusters = args.n_clusters;
+    let batch_size = args.batch_size;
+    let pb = indicatif::ProgressBar::new(total_clusters as u64);
+    let chunk_count = (total_clusters + batch_size - 1) / batch_size;
+    let chunks: Vec<usize> = (0..chunk_count).collect();
 
-/// Split the dataset into train/val sets (roughly).
-pub fn split_dataset(
-    data: &mut Vec<RnaTripletRecord>,
-    train_fraction: f64,
-) -> (Vec<RnaTripletRecord>, Vec<RnaTripletRecord>) {
-    // We can shuffle first, then partition
-    let mut rng = thread_rng();
-    data.shuffle(&mut rng);
-    let train_size = ((data.len() as f64) * train_fraction).round() as usize;
-    let train_data = data[..train_size].to_vec();
-    let val_data = data[train_size..].to_vec();
-    (train_data, val_data)
+    let results: Vec<RnaClusterRecord> = rayon::ThreadPoolBuilder::new()
+        .num_threads(args.num_workers)
+        .build()
+        .unwrap()
+        .install(|| {
+            chunks.par_iter().flat_map(|chunk_id| {
+                let start = chunk_id * batch_size;
+                let cur_batch = std::cmp::min(batch_size, total_clusters - start);
+                let mut cluster_records = Vec::new();
+                for i in 0..cur_batch {
+                    let cluster_id = start + i + 1; // clusters numbered starting at 1.
+                    let recs = generate_cluster(args, cluster_id);
+                    cluster_records.extend(recs);
+                }
+                pb.inc(cur_batch as u64);
+                cluster_records
+            }).collect()
+        });
+    pb.finish();
+    results
 }
 
-/// Save the entire dataset as CSV with a JSON metadata header at the top
-pub fn save_dataset_csv(
+
+/// Change save_dataset_csv to be generic over any serializable type.
+pub fn save_dataset_csv<T: Serialize>(
     file_path: &str,
-    data: &[RnaTripletRecord],
+    data: &[T],
     metadata: &serde_json::Value,
 ) -> Result<(), String> {
     let file = File::create(file_path)
         .map_err(|e| format!("Failed to create file {}: {}", file_path, e))?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = std::io::BufWriter::new(file);
 
-    // write metadata as a comment
-    let meta_str =
-        serde_json::to_string(metadata).map_err(|e| format!("Cannot serialize metadata: {}", e))?;
+    let meta_str = serde_json::to_string(metadata)
+        .map_err(|e| format!("Cannot serialize metadata: {}", e))?;
     writeln!(writer, "# Metadata: {}", meta_str)
         .map_err(|e| format!("Failed to write metadata comment: {}", e))?;
 
-    // now write CSV
     let mut wtr = csv::Writer::from_writer(writer);
     for row in data {
         wtr.serialize(row).map_err(|e| e.to_string())?;
@@ -752,87 +624,20 @@ pub fn save_dataset_csv(
     Ok(())
 }
 
-/// Generate multiple triplets in "batches", store them in a Vec.
-pub fn generate_all_triplets(args: &Cli) -> Vec<RnaTripletRecord> {
-    use rayon::prelude::*;
-    let total = args.num_structures;
-    let batch_size = args.batch_size;
-
-    // Create progress bar
-    let pb = indicatif::ProgressBar::new(total as u64);
-
-    // Build a thread pool with num_workers
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(args.num_workers)
-        .build()
-        .unwrap();
-
-    // Prepare chunk indices
-    let chunk_count = (total + batch_size - 1) / batch_size;
-    let chunk_indices: Vec<usize> = (0..chunk_count).collect();
-
-    let results: Vec<RnaTripletRecord> = pool.install(|| {
-        chunk_indices.par_iter().flat_map(|chunk_id| {
-            let start = chunk_id * batch_size;
-            let cur_size = std::cmp::min(batch_size, total - start);
-            let mut batch_triplets = Vec::with_capacity(cur_size);
-
-            for i in 0..cur_size {
-                let mut triplet = generate_triplet(args);
-                triplet.triplet_id = start + i;
-                batch_triplets.push(triplet);
-            }
-
-            // Remove re-folding of anchors since the anchor structure does not change.
-            /*
-            let anchor_pairs: Vec<(String, String)> = batch_triplets.iter()
-                .map(|r| (format!("A{}", r.triplet_id), r.anchor_seq.clone()))
-                .collect();
-            if let Ok(anchor_map) = fold_rna_batch(&anchor_pairs) {
-                for record in batch_triplets.iter_mut() {
-                    if let Some(struc) = anchor_map.get(&format!("A{}", record.triplet_id)) {
-                        record.anchor_structure = struc.clone();
-                    }
-                }
-            }
-            */
-            // DO NOT fold negatives: keep the appended structure.
-            /*
-            let neg_pairs: Vec<(String, String)> = batch_triplets.iter()
-                .map(|r| (format!("N{}", r.triplet_id), r.negative_seq.clone()))
-                .collect();
-            if let Ok(neg_map) = fold_rna_batch(&neg_pairs) {
-                for record in batch_triplets.iter_mut() {
-                    if let Some(struc) = neg_map.get(&format!("N{}", record.triplet_id)) {
-                        record.negative_structure = struc.clone();
-                    }
-                }
-            }
-            */
-
-            pb.inc(cur_size as u64);
-            batch_triplets
-        }).collect()
-    });
-
-    pb.finish();
-    results
-}
-
-/// Build a metadata object for the run
+/// Update metadata to remove keys for removed options.
 pub fn build_metadata(args: &Cli) -> serde_json::Value {
-    let run_id = Uuid::new_v4();
+    let run_id = uuid::Uuid::new_v4();
     serde_json::json!({
         "run_id": run_id.to_string(),
-        "timestamp": Local::now().to_rfc3339(),
+        "timestamp": chrono::Local::now().to_rfc3339(),
         "parameters": {
-            "num_structures": args.num_structures,
+            "n_clusters": args.n_clusters,
+            "structures_per_cluster": args.structures_per_cluster,
             "seq_min_len": args.seq_min_len,
             "seq_max_len": args.seq_max_len,
             "seq_len_distribution": format!("{:?}", args.seq_len_distribution),
             "seq_len_mean": args.seq_len_mean,
             "seq_len_sd": args.seq_len_sd,
-            "neg_len_variation": args.neg_len_variation,
             "n_stem_indels": args.n_stem_indels,
             "stem_min_size": args.stem_min_size,
             "stem_max_size": args.stem_max_size,
@@ -853,22 +658,12 @@ pub fn build_metadata(args: &Cli) -> serde_json::Value {
             "mloop_min_size": args.mloop_min_size,
             "mloop_max_size": args.mloop_max_size,
             "mloop_max_n_modifications": args.mloop_max_n_modifications,
-            "appending_event_probability": args.appending_event_probability,
-            "both_sides_appending_probability": args.both_sides_appending_probability,
-            "linker_min": args.linker_min,
-            "linker_max": args.linker_max,
-            "appending_size_factor": args.appending_size_factor,
-            "mod_normalization": args.mod_normalization,
-            "normalization_len": args.normalization_len,
             "num_workers": args.num_workers,
             "batch_size": args.batch_size,
             "plot": args.plot,
             "num_plots": args.num_plots,
-            "split": args.split,
-            "train_fraction": args.train_fraction,
-            "val_fraction": args.val_fraction,
             "debug": args.debug,
-            "timing_log": args.timing_log,
+            "timing_log": args.timing_log
         }
     })
 }

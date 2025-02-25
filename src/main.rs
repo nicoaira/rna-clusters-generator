@@ -58,7 +58,7 @@ use log::{debug, error, info};
 
 use crate::cli::parse_cli;
 use crate::data_generation::{
-    build_metadata, generate_all_triplets, save_dataset_csv, split_dataset,
+    build_metadata, generate_all_clusters, save_dataset_csv,
 };
 
 fn main() {
@@ -66,100 +66,82 @@ fn main() {
     let args = parse_cli();
 
     // 2) Initialize logging. If `--debug`, set RUST_LOG=debug, else default to error.
-    let mut log_level = "error";
-    if args.debug {
-        log_level = "debug";
-    }
+    let log_level = if args.debug { "debug" } else { "error" };
     env_logger::Builder::from_env(Env::default().default_filter_or(log_level)).init();
     debug!("Debug mode enabled");
 
     // 3) Create output directory
-    let out_dir = &args.output_dir;
-    create_dir_all(out_dir).unwrap_or_else(|_| {
-        panic!("Failed to create output directory: {}", out_dir);
+    create_dir_all(&args.output_dir).unwrap_or_else(|_| {
+        panic!("Failed to create output directory: {}", &args.output_dir);
     });
-    info!("Created or found output directory: {}", out_dir);
+    info!("Output directory: {}", &args.output_dir);
 
-    // 4) Build metadata
+    // 4) Build metadata (updated parameters will be captured)
     let metadata = build_metadata(&args);
-    // also save metadata.json
-    let metadata_path = Path::new(out_dir).join("metadata.json");
+    let metadata_path = Path::new(&args.output_dir).join("metadata.json");
     {
         let f = File::create(&metadata_path).unwrap_or_else(|_| {
             panic!("Failed to create metadata file: {:?}", metadata_path);
         });
         serde_json::to_writer_pretty(f, &metadata).expect("Failed to write metadata JSON");
-        info!("Saved metadata to {:?}", metadata_path);
+        info!("Metadata saved to {:?}", metadata_path);
     }
 
-    // 5) Generate triplets
-    info!("Starting RNA triplet generation...");
-    let mut triplets = generate_all_triplets(&args);
-    info!(
-        "Generated {} triplets. (Anchor/Positive/Negative)",
-        triplets.len()
-    );
+    // 5) Generate clusters with a customized progress bar
+    info!("Starting RNA cluster generation...");
+    // Create progress bar based on total number of clusters
+    let total_clusters = args.n_clusters;
+    let pb = indicatif::ProgressBar::new(total_clusters as u64);
+    pb.set_style(indicatif::ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} clusters generated")
+        .progress_chars("##-"));
+    
+    let clusters = generate_all_clusters(&args); // This function updates pb internally
+    pb.finish_with_message("Cluster generation complete");
+    info!("Generated {} records across clusters", clusters.len());
 
-    // 6) Save full dataset CSV
-    let csv_path = Path::new(out_dir).join("rna_triplets.csv");
+    // 6) Save CSV dataset
+    let csv_path = Path::new(&args.output_dir).join("rna_clusters.csv");
     {
         let path_str = csv_path.to_string_lossy().to_string();
-        save_dataset_csv(&path_str, &triplets, &metadata)
-            .unwrap_or_else(|err| error!("Error saving full CSV: {}", err));
-        info!("Full dataset saved to {:?}", csv_path);
+        save_dataset_csv(&path_str, &clusters, &metadata)
+            .unwrap_or_else(|err| error!("Error saving CSV: {}", err));
+        info!("CSV saved to {:?}", csv_path);
     }
 
-    // 7) Optionally split dataset
-    if args.split {
-        let (t_frac, v_frac) = decide_split_fractions(args.train_fraction, args.val_fraction);
-        info!("Splitting dataset: train_frac={}, val_frac={}", t_frac, v_frac);
-        let (train_data, val_data) = split_dataset(&mut triplets, t_frac);
+    // 7) (REMOVED) Splitting block removed since splitting is no longer supported.
+    // if args.split {
+    //     let (t_frac, v_frac) = { ... };
+    //     info!("Splitting dataset: train_frac={}, val_frac={}", t_frac, v_frac);
+    //     let mut cluster_data = clusters.clone();
+    //     let (train_data, val_data) = split_dataset(&mut cluster_data, t_frac);
+    //     // Save train and val CSV files ...
+    // }
 
-        let train_csv = Path::new(out_dir).join("rna_triplets_train.csv");
-        {
-            let path_str = train_csv.to_string_lossy().to_string();
-            save_dataset_csv(&path_str, &train_data, &metadata)
-                .unwrap_or_else(|err| error!("Error saving train CSV: {}", err));
-            info!("Train split saved to {:?}", train_csv);
-        }
-
-        let val_csv = Path::new(out_dir).join("rna_triplets_val.csv");
-        {
-            let path_str = val_csv.to_string_lossy().to_string();
-            save_dataset_csv(&path_str, &val_data, &metadata)
-                .unwrap_or_else(|err| error!("Error saving val CSV: {}", err));
-            info!("Val split saved to {:?}", val_csv);
-        }
-    }
-
-    // 8) If `--plot`, we do not implement actual plotting in Rust, but we can mention it
+    // 8) Plotting block remains unchanged
     if args.plot {
         use std::process::Command;
         use rand::seq::SliceRandom;
         use std::fs;
         
-        info!("Plotting requested, sampling {} triplets...", args.num_plots);
+        info!("Plotting requested, sampling {} records...", args.num_plots);
         let mut rng = rand::thread_rng();
-        let sampled: Vec<_> = triplets
+        // Sample from clusters
+        let sampled: Vec<_> = clusters
             .choose_multiple(&mut rng, args.num_plots)
             .cloned()
             .collect();
 
-        // Create directories for plots and temporary scripts/images:
-        let plot_dir = Path::new(out_dir).join("plots");
-        fs::create_dir_all(&plot_dir)
-            .expect("Failed to create plot directory");
-        let temp_dir = Path::new(out_dir).join("temp_plots");
-        fs::create_dir_all(&temp_dir)
-            .expect("Failed to create temporary plot directory");
-
-        // Use absolute (canonical) path for images
+        let plot_dir = Path::new(&args.output_dir).join("plots");
+        fs::create_dir_all(&plot_dir).expect("Failed to create plot directory");
+        let temp_dir = Path::new(&args.output_dir).join("temp_plots");
+        fs::create_dir_all(&temp_dir).expect("Failed to create temporary plot directory");
         let abs_temp_dir = temp_dir.canonicalize().unwrap().to_string_lossy().into_owned();
 
-        // Build a batch script with one rnartist block per drawing.
         let mut batch_script = String::new();
-        for triplet in &sampled {
-            let anchor_block = format!(
+        for record in &sampled {
+            let label = if record.anchor == 1 { "anchor" } else { "positive" };
+            let block = format!(
 r#"rnartist {{
   png {{
     path = "{}"
@@ -170,7 +152,7 @@ r#"rnartist {{
     bn {{
       value = "{}"
       seq = "{}"
-      name = "triplet_{}_anchor"
+      name = "cluster_{}_{}"
     }}
   }}
   theme {{
@@ -183,80 +165,18 @@ r#"rnartist {{
   }}
 }}"#,
                 abs_temp_dir,
-                triplet.anchor_structure,
-                triplet.anchor_seq,
-                triplet.triplet_id
+                record.structure,
+                record.seq,
+                record.cluster,
+                label
             );
-            let positive_block = format!(
-r#"rnartist {{
-  png {{
-    path = "{}"
-    width = 500.0
-    height = 500.0
-  }}
-  ss {{
-    bn {{
-      value = "{}"
-      seq = "{}"
-      name = "triplet_{}_positive"
-    }}
-  }}
-  theme {{
-    details {{
-      value = 5
-    }}
-    scheme {{
-      value = "Pumpkin Vegas"
-    }}
-  }}
-}}"#,
-                abs_temp_dir,
-                triplet.positive_structure,
-                triplet.positive_seq,
-                triplet.triplet_id
-            );
-            let negative_block = format!(
-r#"rnartist {{
-  png {{
-    path = "{}"
-    width = 500.0
-    height = 500.0
-  }}
-  ss {{
-    bn {{
-      value = "{}"
-      seq = "{}"
-      name = "triplet_{}_negative"
-    }}
-  }}
-  theme {{
-    details {{
-      value = 5
-    }}
-    scheme {{
-      value = "Pumpkin Vegas"
-    }}
-  }}
-}}"#,
-                abs_temp_dir,
-                triplet.negative_structure,
-                triplet.negative_seq,
-                triplet.triplet_id
-            );
-            batch_script.push_str(&anchor_block);
-            batch_script.push_str("\n");
-            batch_script.push_str(&positive_block);
-            batch_script.push_str("\n");
-            batch_script.push_str(&negative_block);
+            batch_script.push_str(&block);
             batch_script.push_str("\n");
         }
 
-        // Write the combined batch script:
         let batch_script_path = temp_dir.join("batch_plot.kts");
-        fs::write(&batch_script_path, batch_script)
-            .expect("Failed to write batch plot script");
+        fs::write(&batch_script_path, batch_script).expect("Failed to write batch plot script");
 
-        // Run rnartistcore once on the batch script.
         let status = Command::new("rnartistcore")
             .arg(batch_script_path.to_string_lossy().as_ref())
             .status()
@@ -264,60 +184,7 @@ r#"rnartist {{
         if !status.success() {
             eprintln!("rnartistcore failed on batch plotting script");
         }
-
-        // For each triplet, join its three PNGs into one composite image.
-        for triplet in sampled {
-            let anchor_png = temp_dir.join(format!("triplet_{}_anchor.png", triplet.triplet_id));
-            let positive_png = temp_dir.join(format!("triplet_{}_positive.png", triplet.triplet_id));
-            let negative_png = temp_dir.join(format!("triplet_{}_negative.png", triplet.triplet_id));
-            // Check that all files exist.
-            if !(anchor_png.exists() && positive_png.exists() && negative_png.exists()) {
-                eprintln!("One or more images for triplet {} not found. Skipping montage.", triplet.triplet_id);
-                continue;
-            }
-            let composite_path = plot_dir.join(format!("triplet_{}.png", triplet.triplet_id));
-            let montage_status = std::process::Command::new("montage")
-                .args(&[
-                    anchor_png.to_string_lossy().as_ref(),
-                    positive_png.to_string_lossy().as_ref(),
-                    negative_png.to_string_lossy().as_ref(),
-                    "-tile", "3x1",
-                    "-geometry", "+10+10",
-                    composite_path.to_string_lossy().as_ref(),                ])
-                .status()
-                .expect("Failed to execute montage command");
-            if !montage_status.success() {
-                eprintln!("montage failed for triplet {}", triplet.triplet_id);
-            }
-        }
-        info!("Plot images saved in {:?}", plot_dir);
     }
 
-    info!("Data generation complete. Output in: {}", out_dir);
-}
-
-/// Decide the (train, val) fractions. If both are provided, ensure they sum to 1. Otherwise fill the missing.
-fn decide_split_fractions(
-    train_fraction: Option<f64>,
-    val_fraction: Option<f64>,
-) -> (f64, f64) {
-    match (train_fraction, val_fraction) {
-        (Some(tf), Some(vf)) => {
-            if (tf + vf - 1.0).abs() > 1e-6 {
-                error!("train_fraction + val_fraction != 1. Using defaults (0.8, 0.2).");
-                (0.8, 0.2)
-            } else {
-                (tf, vf)
-            }
-        }
-        (Some(tf), None) => {
-            let vf = 1.0 - tf;
-            (tf, vf)
-        }
-        (None, Some(vf)) => {
-            let tf = 1.0 - vf;
-            (tf, vf)
-        }
-        (None, None) => (0.8, 0.2),
-    }
+    info!("Data generation complete. Output in: {}", &args.output_dir);
 }
